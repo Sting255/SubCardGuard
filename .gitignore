@@ -1,0 +1,23 @@
+# Build outputs
+build/
+app/build/
+.gradle/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Local machine config (SDK path / JDK path)
+local.properties
+
+# Signing material (debug keystore lives in ~/.android, this is just safety)
+*.jks
+*.keystore
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# ZCode plugin state
+.mimosa/
