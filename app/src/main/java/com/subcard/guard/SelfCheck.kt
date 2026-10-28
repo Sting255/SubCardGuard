@@ -122,7 +122,23 @@ object SelfCheck {
             if (GuardService.subNetConnected) "❗检测到副卡存在可上网的蜂窝连接，零流量已被突破！" else "无（零流量承诺当前成立）",
         )
 
-        // 7. 看门狗
+        // 6.5 副卡 IMS 承载（视频彩铃这类媒体流不经过数据开关和 APN）
+        items += Item(
+            if (GuardService.imsIface != null) true else null,
+            "副卡 IMS 承载监控",
+            if (GuardService.imsIface != null) {
+                "已监听接口 ${GuardService.imsIface}" +
+                    if (GuardService.lastImsDelta > 0) "，最近增量 ${GuardService.lastImsDelta / 1024}KB" else "，暂无流量"
+            } else {
+                "未绑定到副卡 IMS 承载（无 VoLTE 或读取受限），此通道暂不可见"
+            },
+        )
+
+        // 7. 副卡 APN 封禁（需要 root 读取）
+        val apn = ApnCheck.run(state.subSubId)
+        items += Item(apn.ok, "副卡 APN 封禁", apn.detail, apn.fixCmd)
+
+        // 8. 看门狗
         items += Item(
             GuardService.running,
             "看门狗服务",

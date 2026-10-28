@@ -274,7 +274,20 @@ class MainActivity : AppCompatActivity() {
     // ---------- 一键自检 ----------
 
     private fun runSelfCheck() {
-        val items = SelfCheck.run(this)
+        llSelfCheck.removeAllViews()
+        llSelfCheck.addView(TextView(this).apply {
+            text = "自检中…"
+            textSize = 13f
+            setPadding(0, dp(8), 0, dp(2))
+        })
+        // APN 检查需要 su 执行 content query，放后台避免卡界面
+        Thread {
+            val items = SelfCheck.run(this)
+            mainHandler.post { renderSelfCheck(items) }
+        }.start()
+    }
+
+    private fun renderSelfCheck(items: List<SelfCheck.Item>) {
         llSelfCheck.removeAllViews()
         items.forEach { item ->
             val mark = when (item.ok) {

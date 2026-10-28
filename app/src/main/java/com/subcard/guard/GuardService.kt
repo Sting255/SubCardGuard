@@ -27,6 +27,7 @@ import androidx.core.app.NotificationCompat
  * - ContentObserver 监听 mobile_data0/1、multi_sim_data_call、smart_dual_sim
  * - 变更后防抖、先读值比对，只有偏离期望态才写回（自己的写入不会造成循环）
  * - 每 15 分钟查一次副卡流量，>0 即告警
+ * - 每 5 分钟核对一次副卡 IMS 承载的字节增量（视频彩铃这类媒体流不经过数据开关和 APN）
  */
 class GuardService : Service() {
 
@@ -62,11 +63,27 @@ class GuardService : Service() {
         var lastSubNetAt: Long = 0
             private set
 
+        /** 副卡 IMS 承载最近一次检测到的增量（字节），供看板展示 */
+        @Volatile
+        var lastImsDelta: Long = 0
+            private set
+
+        /** 副卡 IMS 承载接口名，读不到为 null */
+        @Volatile
+        var imsIface: String? = null
+            private set
+
         @Volatile
         private var lastManualAlertAt: Long = 0
 
         @Volatile
         private var lastLeakAlertAt: Long = 0
+
+        @Volatile
+        private var lastImsAlertAt: Long = 0
+
+        @Volatile
+        private var lastReadFailAlertAt: Long = 0
 
         fun start(ctx: Context) {
             ctx.startForegroundService(Intent(ctx, GuardService::class.java))
@@ -81,6 +98,7 @@ class GuardService : Service() {
     private var handler: Handler? = null
     private var observers: List<ContentObserver> = emptyList()
     private var netCallback: ConnectivityManager.NetworkCallback? = null
+    private var imsMonitor: ImsMonitor? = null
     private val subNetworks = mutableSetOf<Network>()
 
     /** key -> (写入时刻, 写入值)，防止自己写入触发的回调造成来回写 */
@@ -117,6 +135,7 @@ class GuardService : Service() {
     private val fullCheckRunnable = object : Runnable {
         override fun run() {
             checkAndFix()
+            checkIms()
             handler?.postDelayed(this, FULL_CHECK_INTERVAL_MS)
         }
     }
@@ -130,9 +149,11 @@ class GuardService : Service() {
         handler = Handler(worker!!.looper)
         registerObservers()
         registerNetWatch()
+        registerImsWatch()
         handler!!.postDelayed(checkRunnable, 500)
         handler!!.postDelayed(trafficRunnable, 10_000)
-        handler!!.postDelayed(fullCheckRunnable, FULL_CHECK_INTERVAL_MS)
+        // 首次全量核对提前到 15 秒，便于安装后立刻确认 IMS 监控是否可用
+        handler!!.postDelayed(fullCheckRunnable, 15_000L)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -155,6 +176,9 @@ class GuardService : Service() {
             }
         }
         netCallback = null
+        imsMonitor?.stop()
+        imsMonitor = null
+        imsIface = null
         synchronized(subNetworks) { subNetworks.clear() }
         subNetConnected = false
         handler?.removeCallbacksAndMessages(null)
@@ -221,6 +245,38 @@ class GuardService : Service() {
         }
     }
 
+    /**
+     * IMS 承载监控：VoLTE 的媒体流（视频彩铃、视频通话）不经过数据开关与 APN，
+     * 也不出现在普通流量统计里，只能按承载接口的字节增量发现。
+     */
+    private fun registerImsWatch() {
+        if (imsMonitor != null) return
+        imsMonitor = ImsMonitor(
+            this,
+            { SettingsRepo.readState(this).subSubId },
+        ) { iface, bytes ->
+            imsIface = iface
+            lastImsDelta = bytes
+            val now = System.currentTimeMillis()
+            if (now - lastImsAlertAt > 30 * 60 * 1000L) {
+                lastImsAlertAt = now
+                notifyAlert(
+                    "⚠️ 副卡 IMS 通道出现流量",
+                    "接口 $iface 新增 ${bytes / 1024}KB。这是 VoLTE 承载上的媒体流（视频彩铃、视频通话等），" +
+                        "不经过数据开关和 APN，运营商可能把它计入标准资费流量。",
+                )
+            }
+        }.also { it.start() }
+        imsIface = imsMonitor?.currentIface
+    }
+
+    private fun checkIms() {
+        val m = imsMonitor ?: return
+        imsIface = m.currentIface
+        val delta = m.poll() ?: return
+        if (delta > 0) lastImsDelta = delta
+    }
+
     private fun handleCaps(network: Network, caps: NetworkCapabilities) {
         if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return
         if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return
@@ -258,6 +314,20 @@ class GuardService : Service() {
         val fixed = mutableListOf<String>()
         val failed = mutableListOf<String>()
         val manualRequired = mutableListOf<String>()
+
+        // 读不到 ≠ 没问题：系统更新后若开始拦截读取，这里必须报警而不是静默跳过
+        if (!state.subMobileDataReadable) {
+            val now = System.currentTimeMillis()
+            if (now - lastReadFailAlertAt > 60 * 60 * 1000L) {
+                lastReadFailAlertAt = now
+                android.util.Log.w(TAG, "mobile_data read denied")
+                notifyAlert(
+                    "⚠️ 无法读取副卡数据开关",
+                    "系统拒绝了读取，看门狗无法验证这一项，可能已停止修复。请打开 App 执行一键自检，" +
+                        "必要时重新授权 WRITE_SECURE_SETTINGS。",
+                )
+            }
+        }
 
         val mdKey = SettingsRepo.mobileDataKey(state.subPhoneId)
         if (state.subMobileDataReadable && state.subMobileData != 0) {
