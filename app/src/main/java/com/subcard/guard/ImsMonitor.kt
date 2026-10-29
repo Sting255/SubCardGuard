@@ -2,17 +2,17 @@ package com.subcard.guard
 
 import android.content.Context
 import android.net.ConnectivityManager
-import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import java.io.File
 
 /**
  * 副卡 IMS 承载监控。
  *
- * VoLTE 的语音/视频媒体流走 IMS 承载，不经过数据开关，也不经过 APN，
- * 普通流量统计同样看不到它——2026-10-14 那次视频彩铃 932KB 就是这样漏掉的。
- * 这里按接口读取 /proc/net/dev 的收发字节，增量超过阈值即回调告警。
+ * VoLTE 的媒体流（视频彩铃、视频通话）走 IMS 承载，不经过数据开关，也不经过 APN，
+ * 普通流量统计同样看不到它——2026-10-14 的 932KB、10-29 的 4.6MB 都是这样漏掉的。
+ *
+ * 每次轮询都重新枚举当前 IMS 网络再读接口计数，不缓存接口名：
+ * 承载重建时接口编号会变（rmnet_data3 → rmnet_data1），绑定单次句柄会漏掉整段流量。
  */
 class ImsMonitor(
     private val ctx: Context,
@@ -26,99 +26,75 @@ class ImsMonitor(
         const val ALERT_THRESHOLD = 20 * 1024L
     }
 
-    private var callback: ConnectivityManager.NetworkCallback? = null
-    private var iface: String? = null
-    private var lastBytes: Long = -1
+    /** 接口名 -> 上次读数；接口重建时计数归零，这里同步丢弃旧值 */
+    private val lastBytes = HashMap<String, Long>()
     private var suFailed = false
 
-    val currentIface: String? get() = iface
+    @Volatile
+    var currentIface: String? = null
+        private set
 
-    fun start() {
-        if (callback != null) return
-        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
-        val req = NetworkRequest.Builder()
-            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_IMS)
-            .build()
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) = bind(cm, network)
-
-            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
-                bind(cm, network)
-
-            override fun onLost(network: Network) {
-                iface = null
-                lastBytes = -1
-            }
-        }
-        callback = cb
-        try {
-            cm.registerNetworkCallback(req, cb)
-            for (n in cm.allNetworks) {
-                val caps = cm.getNetworkCapabilities(n) ?: continue
-                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) &&
-                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_IMS)
-                ) {
-                    bind(cm, n)
-                }
-            }
-        } catch (e: Exception) {
-            android.util.Log.w(TAG, "ims watch register failed: ${e.message}")
-        }
-    }
-
-    fun stop() {
-        callback?.let {
-            try {
-                (ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
-                    ?.unregisterNetworkCallback(it)
-            } catch (e: Exception) {
-                // 服务销毁时回调可能已失效
-            }
-        }
-        callback = null
-        iface = null
-        lastBytes = -1
-    }
-
-    /** 只认副卡的 IMS 承载，主卡的 IMS 不参与统计 */
-    private fun bind(cm: ConnectivityManager, network: Network) {
-        val caps = cm.getNetworkCapabilities(network) ?: return
-        // 不直接引用 TelephonyNetworkSpecifier（当前 SDK 组合下解析不到），
-        // 从 specifier 的 toString 里取 mSubId，形如 <TelephonyNetworkSpecifier [mSubId = 2]>
-        val subId = Regex("mSubId\\s*=\\s*(\\d+)")
-            .find(caps.networkSpecifier?.toString() ?: "")
-            ?.groupValues?.get(1)?.toIntOrNull() ?: -1
-        if (subId != subSubId()) return
-        val name = cm.getLinkProperties(network)?.interfaceName ?: return
-        if (name != iface) {
-            iface = name
-            lastBytes = -1
-            android.util.Log.i(TAG, "ims bound iface=$name subId=$subId")
-        }
-    }
-
-    /** 读一次并返回增量；承载不存在或读不到返回 null */
+    /** 读一轮并返回副卡 IMS 承载的总增量；没有承载或读不到返回 null */
     fun poll(): Long? {
-        val name = iface ?: return null
-        val now = readIfaceBytes(name) ?: return null
-        val prev = lastBytes
-        lastBytes = now
-        if (prev < 0) {
-            android.util.Log.i(TAG, "ims baseline iface=$name bytes=$now")
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return null
+        val want = subSubId()
+        if (want <= 0) return null
+
+        var total = 0L
+        var seen = false
+        val alive = HashSet<String>()
+
+        for (n in cm.allNetworks) {
+            val caps = cm.getNetworkCapabilities(n) ?: continue
+            if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) continue
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_IMS)) continue
+            // 不直接引用 TelephonyNetworkSpecifier（当前 SDK 组合下解析不到），
+            // 从 specifier 的 toString 里取 mSubId，形如 <TelephonyNetworkSpecifier [mSubId = 2]>
+            val subId = Regex("mSubId\\s*=\\s*(\\d+)")
+                .find(caps.networkSpecifier?.toString() ?: "")
+                ?.groupValues?.get(1)?.toIntOrNull() ?: -1
+            if (subId != want) continue
+
+            val name = cm.getLinkProperties(n)?.interfaceName ?: continue
+            seen = true
+            currentIface = name
+            alive += name
+
+            val bytes = readIfaceBytes(name) ?: continue
+            val prev = lastBytes[name] ?: -1L
+            lastBytes[name] = bytes
+            if (prev < 0) {
+                android.util.Log.i(TAG, "ims baseline iface=$name bytes=$bytes")
+                continue
+            }
+            val d = bytes - prev
+            if (d > 0) {
+                total += d
+                android.util.Log.d(TAG, "ims delta iface=$name bytes=$d")
+            }
+        }
+
+        // 已消失的接口不保留旧读数，避免重建后把计数归零当成负增长
+        lastBytes.keys.retainAll(alive)
+
+        if (!seen) {
+            currentIface = null
             return null
         }
-        val delta = now - prev
-        if (delta <= 0) return null
-        android.util.Log.d(TAG, "ims delta iface=$name bytes=$delta")
-        if (delta >= ALERT_THRESHOLD) onLeak(name, delta)
-        return delta
+        if (total <= 0) return null
+        if (total >= ALERT_THRESHOLD) onLeak(currentIface ?: "ims", total)
+        return total
+    }
+
+    fun reset() {
+        lastBytes.clear()
+        currentIface = null
     }
 
     private fun readIfaceBytes(name: String): Long? =
         readDirect(name) ?: readViaSu(name)
 
-    /** 普通 App 通常能读 /proc/net/dev；读不到再退到 su */
+    /** 普通 App 读 /proc/net/dev 会被 SELinux 拒绝，实际基本都走 su */
     private fun readDirect(name: String): Long? = try {
         File("/proc/net/dev").useLines { lines ->
             lines.firstOrNull { it.trim().startsWith("$name:") }?.let { parse(it) }

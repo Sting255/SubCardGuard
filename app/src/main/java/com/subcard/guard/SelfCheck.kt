@@ -138,6 +138,22 @@ object SelfCheck {
         val apn = ApnCheck.run(state.subSubId)
         items += Item(apn.ok, "副卡 APN 封禁", apn.detail, apn.fixCmd)
 
+        // 7.5 副卡视频通话：关掉后才挡得住主叫方的视频彩铃
+        val vt = SimInfoRepo.isVideoTelephonyOff(state.subSubId)
+        items += Item(
+            vt,
+            "副卡视频通话",
+            when (vt) {
+                true -> "已关（视频彩铃媒体流不会下发，语音 VoLTE 不受影响）"
+                false -> "开着：主叫方放视频彩铃会下发整段媒体流，实测单次可达 4.6MB"
+                null -> "无法读取（需要 root 授权）"
+            },
+            if (vt == false) {
+                "adb shell su -c \"content update --uri content://telephony/siminfo " +
+                    "--where _id=${state.subSubId} --bind volte_vt_enabled:i:0\""
+            } else null,
+        )
+
         // 8. 看门狗
         items += Item(
             GuardService.running,

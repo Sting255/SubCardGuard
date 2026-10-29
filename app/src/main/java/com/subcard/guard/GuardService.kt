@@ -42,6 +42,9 @@ class GuardService : Service() {
         const val TRAFFIC_INTERVAL_MS = 15 * 60 * 1000L
         const val FULL_CHECK_INTERVAL_MS = 5 * 60 * 1000L
 
+        /** IMS 承载轮询间隔：媒体流是一次性下发的，间隔太长会整段错过 */
+        const val IMS_INTERVAL_MS = 60 * 1000L
+
         private const val TAG = "SubGuard"
 
         @Volatile
@@ -84,6 +87,9 @@ class GuardService : Service() {
 
         @Volatile
         private var lastReadFailAlertAt: Long = 0
+
+        @Volatile
+        private var lastVtCheckAt: Long = 0
 
         fun start(ctx: Context) {
             ctx.startForegroundService(Intent(ctx, GuardService::class.java))
@@ -135,8 +141,15 @@ class GuardService : Service() {
     private val fullCheckRunnable = object : Runnable {
         override fun run() {
             checkAndFix()
-            checkIms()
             handler?.postDelayed(this, FULL_CHECK_INTERVAL_MS)
+        }
+    }
+
+    /** IMS 承载独立轮询：比全量核对更密，因为媒体流是一次性下发的 */
+    private val imsRunnable = object : Runnable {
+        override fun run() {
+            checkIms()
+            handler?.postDelayed(this, IMS_INTERVAL_MS)
         }
     }
 
@@ -154,6 +167,7 @@ class GuardService : Service() {
         handler!!.postDelayed(trafficRunnable, 10_000)
         // 首次全量核对提前到 15 秒，便于安装后立刻确认 IMS 监控是否可用
         handler!!.postDelayed(fullCheckRunnable, 15_000L)
+        handler!!.postDelayed(imsRunnable, 5_000L)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -176,7 +190,7 @@ class GuardService : Service() {
             }
         }
         netCallback = null
-        imsMonitor?.stop()
+        imsMonitor?.reset()
         imsMonitor = null
         imsIface = null
         synchronized(subNetworks) { subNetworks.clear() }
@@ -266,8 +280,7 @@ class GuardService : Service() {
                         "不经过数据开关和 APN，运营商可能把它计入标准资费流量。",
                 )
             }
-        }.also { it.start() }
-        imsIface = imsMonitor?.currentIface
+        }
     }
 
     private fun checkIms() {
@@ -342,6 +355,24 @@ class GuardService : Service() {
                 markWrite(SettingsRepo.KEY_SMART_DUAL_SIM, 0)
                 fixed += "智能双卡切换"
             } else failed += "智能双卡切换"
+        }
+
+        // 副卡视频通话能力：关掉后才能挡住主叫方推送的视频彩铃。
+        // 2026-10-29 实测：关闭前同号码拨出产生 4.6MB IMS 下行，关闭后仅增 580 字节。
+        // 写 siminfo 需要 su，30 分钟核对一次即可。
+        val vtNow = System.currentTimeMillis()
+        if (vtNow - lastVtCheckAt > 30 * 60 * 1000L) {
+            lastVtCheckAt = vtNow
+            when (SimInfoRepo.isVideoTelephonyOff(state.subSubId)) {
+                false -> if (SimInfoRepo.disableVideoTelephony(state.subSubId)) {
+                    fixed += "副卡视频通话"
+                } else {
+                    failed += "副卡视频通话"
+                }
+                else -> {
+                    // true = 已关；null = 读不到（无 root），静默跳过
+                }
+            }
         }
 
         // 默认上网卡：本 ROM 实测（2026-09-29）无论 App 还是 adb 写 multi_sim_data_call，
